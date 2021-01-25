@@ -16,8 +16,11 @@ use crate::{
     ebr::pin,
     pagecache::{pread_exact, pwrite_all, MessageKind},
     stack::Stack,
-    Error, Lsn, Result,
+    Error, Result,
 };
+
+const PARITY_BYTE_ON: u8 = 255;
+const PARITY_BYTE_OFF: u8 = 255;
 
 #[cfg(not(feature = "testing"))]
 pub(crate) const MIN_SZ: u64 = 32 * 1024;
@@ -28,14 +31,36 @@ pub(crate) const MIN_SZ: u64 = 128;
 const MIN_TRAILING_ZEROS: u64 = MIN_SZ.trailing_zeros() as u64;
 
 pub type SlabId = u8;
-pub type SlabIdx = u32;
+pub type ItemId = u32;
 
 /// A unique identifier for a particular slot in the heap
 #[allow(clippy::module_name_repetitions)]
 #[derive(Clone, Copy, PartialOrd, Ord, Eq, PartialEq, Hash)]
-pub struct HeapId {
-    pub location: u64,
-    pub original_lsn: Lsn,
+pub struct HeapId(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParityBit(bool);
+
+impl ParityBit {
+    fn flip(self) -> ParityBit {
+        ParityBit(!self.0)
+    }
+
+    const fn try_from(byte: u8) -> Result<ParityBit> {
+        match byte {
+            PARITY_BYTE_ON => Ok(ParityBit(true)),
+            PARITY_BYTE_OFF => Ok(ParityBit(false)),
+            other => Err(Error::corruption(None)),
+        }
+    }
+
+    const fn into_byte(self) -> u8 {
+        if self.0 {
+            PARITY_BYTE_ON
+        } else {
+            PARITY_BYTE_OFF
+        }
+    }
 }
 
 impl Debug for HeapId {
@@ -43,32 +68,38 @@ impl Debug for HeapId {
         &self,
         f: &mut fmt::Formatter<'_>,
     ) -> std::result::Result<(), fmt::Error> {
-        let (slab, idx, original_lsn) = self.decompose();
+        let (slab, idx, parity_bit) = self.decompose();
         f.debug_struct("HeapId")
             .field("slab", &slab)
             .field("idx", &idx)
-            .field("original_lsn", &original_lsn)
+            .field("parity_bit", &parity_bit)
             .finish()
     }
 }
 
 impl HeapId {
-    pub fn decompose(&self) -> (SlabId, SlabIdx, Lsn) {
+    fn flip_parity_bit(self) -> HeapId {
+        let (sid, iid, pb) = self.decompose();
+        HeapId::compose(sid, iid, pb.flip())
+    }
+
+    pub fn decompose(&self) -> (SlabId, ItemId, ParityBit) {
         const IDX_MASK: u64 = (1 << 32) - 1;
-        let slab_id =
-            u8::try_from((self.location >> 32).trailing_zeros()).unwrap();
-        let slab_idx = u32::try_from(self.location & IDX_MASK).unwrap();
-        (slab_id, slab_idx, self.original_lsn)
+        let parity_bit = self.0 & 1 << 32 != 0;
+        let slab_id = u8::try_from((self.0 >> 33).trailing_zeros()).unwrap();
+        let item_id = u32::try_from(self.0 & IDX_MASK).unwrap();
+        (slab_id, item_id, ParityBit(parity_bit))
     }
 
     pub fn compose(
         slab_id: SlabId,
-        slab_idx: SlabIdx,
-        original_lsn: Lsn,
+        item_id: ItemId,
+        parity: ParityBit,
     ) -> HeapId {
-        let slab = 1 << (32 + u64::from(slab_id));
-        let heap_id = slab | u64::from(slab_idx);
-        HeapId { location: heap_id, original_lsn }
+        let slab = 1 << (33 + u64::from(slab_id));
+        let parity_bit = if parity.0 { 1 << 32 } else { 0 };
+        let heap_id = slab | u64::from(item_id);
+        HeapId(slab | parity_bit | heap_id)
     }
 
     fn offset(&self) -> u64 {
@@ -101,7 +132,7 @@ fn size_to_slab_id(size: u64) -> SlabId {
 }
 
 pub(crate) struct Reservation {
-    slab_free: Arc<Stack<u32>>,
+    slab_free: Arc<Stack<HeapId>>,
     completed: bool,
     file: File,
     pub heap_id: HeapId,
@@ -111,8 +142,8 @@ pub(crate) struct Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         if !self.completed {
-            let (_slab_id, idx, _) = self.heap_id.decompose();
-            self.slab_free.push(idx, &pin());
+            self.slab_free.push(self.heap_id, &pin());
+            punch_hole(&self.file, self.heap_id);
         }
     }
 }
@@ -205,7 +236,7 @@ impl Heap {
 
         for page_state in &snapshot.pt {
             for heap_id in page_state.heap_ids() {
-                let (slab_id, idx, _lsn) = heap_id.decompose();
+                let (slab_id, idx, _parity_bit) = heap_id.decompose();
 
                 // set the bit for this slot
                 let block = idx / 64;
@@ -227,7 +258,11 @@ impl Heap {
                 let free = bitmap[block as usize] & bitmask == 0;
 
                 if free {
-                    slab.free(idx);
+                    slab.free(HeapId::compose(
+                        slab.slab_id,
+                        block,
+                        ParityBit(false),
+                    ));
                 }
             }
         }
@@ -239,24 +274,20 @@ impl Heap {
         use_compression: bool,
     ) -> Result<(MessageKind, Vec<u8>)> {
         log::trace!("Heap::read({:?})", heap_id);
-        let (slab_id, slab_idx, original_lsn) = heap_id.decompose();
-        self.slabs[slab_id as usize].read(
-            slab_idx,
-            original_lsn,
-            use_compression,
-        )
+        let (slab_id, item_id, parity_bit) = heap_id.decompose();
+        self.slabs[slab_id as usize].read(item_id, parity_bit, use_compression)
     }
 
     pub fn free(&self, heap_id: HeapId) {
         log::trace!("Heap::free({:?})", heap_id);
-        let (slab_id, slab_idx, _) = heap_id.decompose();
-        self.slabs[slab_id as usize].free(slab_idx)
+        let (slab_id, _, _) = heap_id.decompose();
+        self.slabs[slab_id as usize].free(heap_id)
     }
 
-    pub fn reserve(&self, size: u64, original_lsn: Lsn) -> Reservation {
+    pub fn reserve(&self, size: u64) -> Reservation {
         assert!(size < 1 << 48);
         let slab_id = size_to_slab_id(size);
-        let ret = self.slabs[slab_id as usize].reserve(original_lsn);
+        let ret = self.slabs[slab_id as usize].reserve();
         log::trace!("Heap::reserve({}) -> {:?}", size, ret.heap_id);
         ret
     }
@@ -267,7 +298,7 @@ struct Slab {
     file: File,
     slab_id: u8,
     tip: AtomicU32,
-    free: Arc<Stack<u32>>,
+    free: Arc<Stack<HeapId>>,
 }
 
 impl Slab {
@@ -297,14 +328,14 @@ impl Slab {
 
     fn read(
         &self,
-        slab_idx: SlabIdx,
-        original_lsn: Lsn,
+        item_id: ItemId,
+        parity_bit: ParityBit,
         use_compression: bool,
     ) -> Result<(MessageKind, Vec<u8>)> {
         let bs = slab_id_to_size(self.slab_id);
-        let offset = u64::from(slab_idx) * bs;
+        let offset = u64::from(item_id) * bs;
 
-        log::trace!("reading heap slab slot {} at offset {}", slab_idx, offset);
+        log::trace!("reading heap slab slot {} at offset {}", item_id, offset);
 
         let mut heap_buf = vec![0; usize::try_from(bs).unwrap()];
 
@@ -319,18 +350,16 @@ impl Slab {
         let actual_crc = hasher.finalize();
 
         if actual_crc == stored_crc {
-            let actual_lsn = Lsn::from_le_bytes(
-                heap_buf[5..13].as_ref().try_into().unwrap(),
-            );
-            if actual_lsn != original_lsn {
+            let actual_parity_bit = ParityBit::try_from(heap_buf[5])?;
+            if actual_parity_bit != parity_bit {
                 log::debug!(
-                    "heap slot lsn {} does not match expected original lsn {}",
-                    actual_lsn,
-                    original_lsn
+                    "heap slot parity bit {:?} does not match expected original parity bit {:?}",
+                    actual_parity_bit,
+                    parity_bit
                 );
                 return Err(Error::corruption(None));
             }
-            let buf = heap_buf[13..].to_vec();
+            let buf = heap_buf[6..].to_vec();
             let buf = if use_compression {
                 crate::pagecache::decompress(buf)
             } else {
@@ -347,29 +376,30 @@ impl Slab {
         }
     }
 
-    fn reserve(&self, original_lsn: Lsn) -> Reservation {
-        let (idx, from_tip) = if let Some(idx) = self.free.pop(&pin()) {
+    fn reserve(&self) -> Reservation {
+        let (heap_id, from_tip) = if let Some(idx) = self.free.pop(&pin()) {
             log::trace!(
-                "reusing heap index {} in slab for sizes of {}",
+                "reusing heap id {:?} in slab for sizes of {}",
                 idx,
                 slab_id_to_size(self.slab_id),
             );
-            (idx, false)
+            (idx.flip_parity_bit(), false)
         } else {
             log::trace!(
                 "no free heap slots in slab for sizes of {}",
                 slab_id_to_size(self.slab_id),
             );
-            (self.tip.fetch_add(1, Acquire), true)
+            let iid = self.tip.fetch_add(1, Acquire);
+            let heap_id = HeapId::compose(self.slab_id, iid, ParityBit(true));
+
+            (heap_id, true)
         };
 
         log::trace!(
-            "heap reservation for slot {} in the slab for sizes of {}",
-            idx,
+            "reservating {:?} in the slab for sizes of {}",
+            heap_id,
             slab_id_to_size(self.slab_id),
         );
-
-        let heap_id = HeapId::compose(self.slab_id, idx, original_lsn);
 
         Reservation {
             slab_free: self.free.clone(),
@@ -380,49 +410,50 @@ impl Slab {
         }
     }
 
-    fn free(&self, idx: u32) {
-        self.punch_hole(idx);
-        self.free.push(idx, &pin());
+    fn free(&self, hid: HeapId) {
+        punch_hole(&self.file, hid);
+        self.free.push(hid, &pin());
     }
+}
 
-    fn punch_hole(&self, #[allow(unused)] idx: u32) {
-        #[cfg(all(target_os = "linux", not(miri)))]
-        {
-            use std::{
-                os::unix::io::AsRawFd,
-                sync::atomic::{AtomicBool, Ordering::Relaxed},
+fn punch_hole(file: &File, heap_id: HeapId) {
+    #[cfg(all(target_os = "linux", not(miri)))]
+    {
+        use std::{
+            os::unix::io::AsRawFd,
+            sync::atomic::{AtomicBool, Ordering::Relaxed},
+        };
+
+        use libc::{fallocate, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE};
+
+        static HOLE_PUNCHING_ENABLED: AtomicBool = AtomicBool::new(true);
+        const MODE: i32 = FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE;
+
+        if HOLE_PUNCHING_ENABLED.load(Relaxed) {
+            let (slab_id, iid, _) = heap_id.decompose();
+            let bs = i64::try_from(slab_id_to_size(slab_id)).unwrap();
+            let offset = i64::from(iid) * bs;
+
+            let fd = file.as_raw_fd();
+
+            let ret = unsafe {
+                fallocate(
+                    fd,
+                    MODE,
+                    #[allow(clippy::useless_conversion)]
+                    offset.try_into().unwrap(),
+                    #[allow(clippy::useless_conversion)]
+                    bs.try_into().unwrap(),
+                )
             };
 
-            use libc::{fallocate, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE};
-
-            static HOLE_PUNCHING_ENABLED: AtomicBool = AtomicBool::new(true);
-            const MODE: i32 = FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE;
-
-            if HOLE_PUNCHING_ENABLED.load(Relaxed) {
-                let bs = i64::try_from(slab_id_to_size(self.slab_id)).unwrap();
-                let offset = i64::from(idx) * bs;
-
-                let fd = self.file.as_raw_fd();
-
-                let ret = unsafe {
-                    fallocate(
-                        fd,
-                        MODE,
-                        #[allow(clippy::useless_conversion)]
-                        offset.try_into().unwrap(),
-                        #[allow(clippy::useless_conversion)]
-                        bs.try_into().unwrap(),
-                    )
-                };
-
-                if ret != 0 {
-                    let err = std::io::Error::last_os_error();
-                    log::error!(
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                log::error!(
                         "failed to punch hole in heap file: {:?}. disabling hole punching",
                         err
                     );
-                    HOLE_PUNCHING_ENABLED.store(false, Relaxed);
-                }
+                HOLE_PUNCHING_ENABLED.store(false, Relaxed);
             }
         }
     }

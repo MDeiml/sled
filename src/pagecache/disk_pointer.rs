@@ -1,6 +1,6 @@
 use std::num::NonZeroU64;
 
-use super::{HeapId, LogOffset};
+use super::{HeapId, LogOffset, ParityBit};
 use crate::*;
 
 /// A pointer to a location on disk or an off-log heap item.
@@ -36,7 +36,11 @@ impl DiskPtr {
     }
 
     pub(crate) fn heap_id(&self) -> Option<HeapId> {
-        if let DiskPtr::Heap(_, heap_id) = self { Some(*heap_id) } else { None }
+        if let DiskPtr::Heap(_, heap_id) = self {
+            Some(*heap_id)
+        } else {
+            None
+        }
     }
 
     #[doc(hidden)]
@@ -54,15 +58,19 @@ impl DiskPtr {
         }
     }
 
-    pub(crate) fn original_lsn(&self) -> Lsn {
+    pub(crate) fn parity_bit(&self) -> ParityBit {
         match self {
-            DiskPtr::Heap(_, heap_id) => heap_id.original_lsn,
+            DiskPtr::Heap(_, heap_id) => heap_id.decompose().2,
             DiskPtr::Inline(_) => panic!("called original_lsn on non-Heap"),
         }
     }
 
     pub(crate) fn heap_pointer_merged_into_snapshot(&self) -> bool {
-        if let DiskPtr::Heap(None, _) = self { true } else { false }
+        if let DiskPtr::Heap(None, _) = self {
+            true
+        } else {
+            false
+        }
     }
 }
 

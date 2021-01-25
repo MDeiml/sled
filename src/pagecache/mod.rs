@@ -47,7 +47,7 @@ use self::{
 };
 
 pub(crate) use self::{
-    heap::{Heap, HeapId},
+    heap::{Heap, HeapId, ParityBit},
     logger::{
         read_message, read_segment_header, MessageHeader, SegmentHeader,
         SegmentNumber,
@@ -1344,7 +1344,7 @@ impl PageCacheInner {
                 trace!("rewriting pointer to heap item with pid {}", pid);
 
                 let snapshot_min_lsn = self.snapshot_min_lsn.load(Acquire);
-                let original_lsn = lone_cache_info.pointer.original_lsn();
+                //let original_lsn = lone_cache_info.pointer.original_lsn();
                 let skip_log = original_lsn < snapshot_min_lsn;
 
                 let heap_id = lone_cache_info.pointer.heap_id().unwrap();
